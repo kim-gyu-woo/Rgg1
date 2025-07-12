@@ -1,0 +1,137 @@
+# 반려동물 개별적 인식
+
+import cv2
+from ultralytics import YOLO
+import os
+import time
+import numpy as np
+from picamera2 import Picamera2 
+
+model_path = '/home/rgg/mjd/best.onnx' 
+
+output_dir = '/home/rgg/Desktop/mjd_results' #캡쳐 결과 저장
+os.makedirs(output_dir, exist_ok=True) 
+
+try:
+    model = YOLO(model_path)
+    print(f"모델 '{model_path}' 로드 성공!")
+except Exception as e:
+    print(f"오류: 모델 로드 중 문제가 발생했습니다: {e}")
+    exit()
+
+def run_inference_on_image_file(input_image_path):
+    """
+    이미지 파일에 대해 객체 감지 추론을 수행하고 결과를 파일로 저장합니다.
+    """
+    if not os.path.exists(input_image_path):
+        print(f"오류: 입력 이미지 파일 '{input_image_path}'를 찾을 수 없습니다.")
+        return
+
+    print(f"이미지 '{input_image_path}'에 대해 추론 시작...")
+
+    start_time = time.time()
+    results = model.predict(source=input_image_path, conf=0.5, iou=0.7, verbose=False)
+    end_time = time.time()
+    print(f"추론 시간: {end_time - start_time:.4f} 초")
+
+    for i, r in enumerate(results):
+        annotated_image = r.plot() 
+
+        output_filename = f"detected_{os.path.basename(input_image_path).replace('.', f'_result_{i}.')}"
+        output_filepath = os.path.join(output_dir, output_filename)
+        cv2.imwrite(output_filepath, annotated_image)
+        print(f"결과 이미지가 '{output_filepath}'에 저장되었습니다.")
+
+        if r.boxes:
+            for box in r.boxes:
+                class_name = model.names[int(box.cls)]
+                confidence = box.conf.item()
+                xyxy = box.xyxy[0].tolist() 
+                print(f"  - 감지: {class_name}, 신뢰도: {confidence:.2f}, 바운딩 박스: {xyxy}")
+        else:
+            print("  - 감지된 객체 없음.")
+
+
+def run_inference_on_camera_picamera2():
+    """
+    Picamera2를 사용하여 라즈베리파이 카메라로부터 실시간 스트림을 받아
+    객체 감지 추론을 수행하고 결과를 이미지 파일로 연속 저장하며, 화면에 표시합니다.
+    """
+    try:
+        picam2 = Picamera2()
+        camera_config = picam2.create_video_configuration(main={"size": (640, 480)})
+        picam2.configure(camera_config)
+        picam2.start()
+        print("Picamera2 카메라 시작 성공!")
+    except Exception as e:
+        print(f"오류: Picamera2 카메라 초기화 및 시작 중 문제가 발생했습니다: {e}")
+        print("다음을 확인하세요:")
+        print("  1. 라즈베리파이 공식 카메라 모듈이 올바르게 연결되었는지.")
+        print("  2. 'sudo raspi-config'에서 카메라가 활성화되었는지.")
+        print("  3. 'sudo apt install -y libcamera-dev rpicam-apps'가 실행되었는지.")
+        print("  4. 라즈베리파이를 재부팅했는지.")
+        return
+
+    print(f"Picamera2를 이용한 실시간 추론 시작.")
+    print(f"결과 이미지는 '{output_dir}' 폴더에 캡처될 때마다 저장됩니다.")
+    print("화면을 닫으려면 'q' 키를 누르세요.")
+
+    frame_count = 0
+    start_capture_time = time.time()
+    save_interval_seconds = 2
+    last_save_time = time.time()
+
+    try:
+        while True:
+            
+            frame_rgb = picam2.capture_array()
+           
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            current_frame_time = time.time()
+
+            results = model.predict(source=frame_bgr, conf=0.5, iou=0.7, verbose=False)
+
+            annotated_frame = frame_bgr.copy()
+            for r in results:
+                annotated_frame = r.plot() 
+
+                if r.boxes:
+                    for box in r.boxes:
+                        class_name = model.names[int(box.cls)]
+                        confidence = box.conf.item()
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        cv2.putText(annotated_frame, f"{class_name} {confidence:.2f}", (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        print(f"  프레임 {frame_count}: {class_name}, 신뢰도: {confidence:.2f}")
+                else:
+                    cv2.putText(annotated_frame, "No object detected", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    print(f"  프레임 {frame_count}: 감지된 객체 없음.")
+
+            cv2.imshow("Raspberry Pi RPS Detection", annotated_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("사용자가 'q' 키를 눌러 종료합니다.")
+                break
+
+            if (current_frame_time - last_save_time) >= save_interval_seconds:
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                output_filepath = os.path.join(output_dir, f"camera_output_{timestamp}_{frame_count}.jpg")
+                cv2.imwrite(output_filepath, annotated_frame)
+                print(f"프레임 저장: {output_filepath}")
+                last_save_time = current_frame_time 
+
+            frame_count += 1
+
+    except KeyboardInterrupt:
+        print("\n사용자가 스크립트를 중단했습니다.")
+    except Exception as e:
+        print(f"\n실시간 추론 중 오류 발생: {e}")
+    finally:
+        picam2.stop() 
+        cv2.destroyAllWindows() 
+        print("Picamera2 실시간 추론 종료.")
+
+if __name__ == "__main__":
+    run_inference_on_camera_picamera2()
