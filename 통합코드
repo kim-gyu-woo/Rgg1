@@ -1,0 +1,331 @@
+# 반려동물 개별 인식 및 자동 급식/알림 시스템 통합 코드
+
+import cv2
+from ultralytics import YOLO
+import os
+import time
+import numpy as np
+import serial
+from datetime import datetime, time as dt_time
+from picamera2 import Picamera2 
+import threading 
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
+
+
+SERVICE_ACCOUNT_KEY_PATH = 'trgg-79672-firebase-adminsdk-fbsvc-61d9fb334b.json'
+DATABASE_URL = 'https://trgg-79672-default-rtdb.firebaseio.com/' 
+
+try:
+    cred = credentials.Certificate(SERVICE_ACCOUNT_KEY_PATH)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': DATABASE_URL
+    })
+    print("Firebase 초기화 성공.")
+except Exception as e:
+    print(f"오류: Firebase 초기화 실패: {e}")
+    exit() 
+
+notification_ref = db.reference('app_notifications')
+motor_control_ref = db.reference('Motor')
+SERIAL_PORT = '/dev/ttyACM0' 
+BAUD_RATE = 9600 
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2) 
+    print(f"시리얼 포트 {SERIAL_PORT} 연결 성공")
+except serial.SerialException as e:
+    print(f"오류: 시리얼 포트 연결 실패: {e}")
+    exit() 
+
+model_path = '/home/gyu_u/mjd/bestnewnew.onnx' 
+
+try:
+    model = YOLO(model_path, task='detect') 
+    print(f"YOLOv8 모델 '{model_path}' 로드 성공!")
+except Exception as e:
+    print(f"오류: YOLOv8 모델 로드 중 문제가 발생했습니다: {e}")
+    exit() 
+
+try:
+    picam2 = Picamera2()
+    camera_capture_resolution = (640, 480) 
+    target_fps_for_capture = 103 
+    yolo_input_resolution = (320, 320) 
+
+    frame_duration_us = int(1000000 / target_fps_for_capture)
+
+    camera_config = picam2.create_video_configuration(main={"size": camera_capture_resolution})
+    camera_config["controls"] = {
+        "FrameDurationLimits": (frame_duration_us, frame_duration_us) 
+    }
+
+    picam2.configure(camera_config)
+    picam2.start()
+    print(f"Picamera2 카메라 시작 성공! 캡처 해상도")
+
+except Exception as e:
+    print(f"오류: Picamera2 카메라 초기화 및 시작 중 문제가 발생했습니다: {e}")
+    exit() 
+
+# 객체별 모터 작동 및 아두이노 명령어 매핑
+OBJECT_ACTIONS = {
+    "Mong": {"duration": 2, "command": "D1", "notification_msg": "몽이밥먹었어요!"},
+    "JJangGu": {"duration": 2, "command": "D2", "notification_msg": "짱구밥먹었어요!"},
+    "DanBi": {"duration": 2, "command": "C1", "notification_msg": "단비밥먹었어요!"}
+}
+ALL_PET_NAMES = list(OBJECT_ACTIONS.keys())
+
+REQUIRED_ACCURACY = 0.7 #신뢰도 0.7
+
+#보호자에게 앱 알림 Firebase
+def send_app_notification(message):
+    try:
+        notification_ref.update({
+            'notification_type': 'pet_feed_action',
+            'message': message,
+            'timestamp': int(time.time()),
+            'trigger_notification': True 
+        })
+        print(f"[Firebase 알림 요청] '{message}'")
+        time.sleep(2) 
+        notification_ref.update({
+            'trigger_notification': False
+        })
+    except Exception as e:
+        print(f"오류: Firebase 알림 전송 실패: {e}")
+
+#모터 작동 시간대 설정 및 오늘 작동 여부
+TIME_SLOTS = {
+    "lunch": {
+        "start": dt_time(11, 30), "end": dt_time(19, 30),
+        "activated_pets": {name: False for name in ALL_PET_NAMES} 
+    },
+    "dinner": {
+        "start": dt_time(22, 0), "end": dt_time(23, 0),
+        "activated_pets": {name: False for name in ALL_PET_NAMES}
+    }
+}
+
+last_checked_date = datetime.now().date()
+
+#앱 > 아두이노
+def firebase_motor_control_thread(serial_port_obj):
+    print("[Firebase 모터 제어 스레드] 시작됨.")
+    motor_command_ref = db.reference('Motor').child('command')
+    
+    while True:
+        try:
+            motor_cmd = motor_command_ref.get()
+            
+            if isinstance(motor_cmd, str):
+                motor_cmd = motor_cmd.strip('"')
+
+            if motor_cmd is not None and motor_cmd in ['D1', 'D2', 'C1']:
+                motor_cmd_str = str(motor_cmd).strip()
+                
+                if motor_cmd_str == "D1":
+                    app_notification_msg = "몽이밥먹었어요!"
+                elif motor_cmd_str == "D2":
+                    app_notification_msg = "짱구밥먹었어요!"
+                elif motor_cmd_str == "C1":
+                    app_notification_msg = "단비밥먹었어요!"
+                else:
+                    app_notification_msg = "앱에서제어명령도착"
+                
+                send_app_notification(app_notification_msg)
+                
+                print(f"[Firebase 모터 제어 스레드] 명령 수신: {motor_cmd_str} -> 아두이노로 전송")
+                serial_port_obj.write(motor_cmd_str.encode() + b'\n')
+                
+                response = ""
+                start_wait_time = time.time()
+                while (time.time() - start_wait_time) < 10:
+                    if serial_port_obj.in_waiting > 0:
+                        response = serial_port_obj.readline().decode('utf-8').strip()
+                        if response == "ARDUINO_CMD_COMPLETE":
+                            print(f"[Firebase 모터 제어 스레드] 아두이노 완료 신호 수신: {response}")
+                            break
+                    time.sleep(0.01)
+                
+                if response == "ARDUINO_CMD_COMPLETE":
+                    motor_command_ref.set('IDLE')
+                    print(f"[Firebase 모터 제어 스레드] Firebase 'Motor/command' 경로를 'IDLE'로 초기화.")
+                else:
+                    motor_command_ref.set('IDLE')
+                    print(f"[Firebase 모터 제어 스레드] 아두이노로부터 완료 신호 수신 실패 또는 타임아웃. Firebase 'Motor/command' 경로 초기화.")
+
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"오류: [Firebase 모터 제어 스레드] 오류 발생: {e}")
+            time.sleep(5)
+
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Firebase 모터 제어 스레드] 오류 발생: {e}")
+            time.sleep(5) 
+
+#메인루프
+def main_loop():
+    global last_checked_date 
+    
+    print("객체 인식을 시작합니다. 'q' 키를 눌러 종료하세요.")
+    
+    detection_interval_seconds = 5 
+    
+    last_detection_trigger_time = time.time()
+    last_status_print_time = time.time()
+
+    inference_times_sum = 0 
+    inference_frame_count = 0 
+
+    try: 
+        while True:
+            current_datetime = datetime.now()
+            current_time = current_datetime.time()
+            current_date = current_datetime.date()
+
+            if current_date != last_checked_date:
+                print(f"\n새로운 날({current_date})이 시작되었습니다. 모든 급식 시간대와 반려동물별 플래그 초기화.")
+                for slot_name in TIME_SLOTS:
+                    for pet_name in ALL_PET_NAMES:
+                        TIME_SLOTS[slot_name]["activated_pets"][pet_name] = False
+                last_checked_date = current_date
+                
+            active_slot_info = None
+            current_slot_name = "None"
+            for slot_name, slot_info in TIME_SLOTS.items():
+                if slot_info["start"] <= current_time <= slot_info["end"]:
+                    active_slot_info = slot_info
+                    current_slot_name = slot_name 
+                    break
+
+            frame_rgb = picam2.capture_array()
+            
+            if frame_rgb is None or not isinstance(frame_rgb, np.ndarray) or frame_rgb.size == 0:
+                print("유효하지 않은 프레임 반환됨. 다음 프레임 시도.")
+                time.sleep(0.01) 
+                continue
+
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            current_frame_time = time.time()
+
+            results = None 
+
+            if active_slot_info and (current_datetime.timestamp() - last_detection_trigger_time) >= detection_interval_seconds:
+                last_detection_trigger_time = current_datetime.timestamp()
+
+                print(f"\n[{current_slot_name} 시간대] 객체 인식 시도중~...")
+
+                resized_frame_bgr = cv2.resize(frame_bgr, yolo_input_resolution, interpolation=cv2.INTER_AREA)
+                
+                inference_start_time = time.time()
+                results = model.predict(source=resized_frame_bgr, conf=0.5, iou=0.7, verbose=False) 
+                inference_end_time = time.time()
+                inference_duration = inference_end_time - inference_start_time
+                
+                inference_times_sum += inference_duration 
+                inference_frame_count += 1 
+                
+                detected_pet_name = "no_object"
+                detection_confidence = 0.0
+                
+                if results and results[0].boxes:
+                    best_conf = 0.0
+                    best_cls = -1
+                    for box in results[0].boxes:
+                        if box.conf.item() > best_conf:
+                            best_conf = box.conf.item()
+                            best_cls = int(box.cls)
+                    
+                    if best_cls != -1:
+                        detected_pet_name = model.names[best_cls]
+                        detection_confidence = best_conf
+                        
+                print(f"  인식 결과: 객체='{detected_pet_name}', 신뢰도='{detection_confidence:.2f}'")
+
+                if detected_pet_name in OBJECT_ACTIONS \
+                   and detection_confidence >= REQUIRED_ACCURACY \
+                   and not active_slot_info["activated_pets"][detected_pet_name]: 
+                    
+                    action_info = OBJECT_ACTIONS[detected_pet_name]
+                    command_to_arduino = action_info["command"] 
+                    notification_message = action_info["notification_msg"] 
+                    
+                    print(f"조건 만족: {detected_pet_name} (신뢰도: {detection_confidence:.2f}) -> 아두이노에 '{command_to_arduino}' 명령 전송")
+                    ser.write(command_to_arduino.encode() + b'\n') 
+                    
+                    send_app_notification(notification_message) 
+                    
+                    active_slot_info["activated_pets"][detected_pet_name] = True
+                    print(f"** {current_slot_name} 시간대 '{detected_pet_name}' 작동 완료. 이 시간대에는 다시 작동하지 않습니다. **")
+                    
+                else: 
+                    if detected_pet_name in OBJECT_ACTIONS and detection_confidence >= REQUIRED_ACCURACY and active_slot_info["activated_pets"][detected_pet_name]:
+                        print(f"'{detected_pet_name}'이(가) 인식되었으나, 현재 시간대({current_slot_name})에 이미 인식에 성공하였습니다. (추가 급여 없음)")
+                    elif detected_pet_name in OBJECT_ACTIONS and detection_confidence < REQUIRED_ACCURACY:
+                        print(f"'{detected_pet_name}'이(가) 인식되었으나, 신뢰도({detection_confidence:.2f})가 너무 낮아 얼굴 인식에 실패했습니다 (알림 없음)")
+                    else:
+                        print(f"지정된 객체가 아니거나, 다른 조건에 부합하지 않아 모터를 작동하지 않습니다.")
+            else:
+                status_message = "현재 인식 시간대가 아닙니다."
+                if not active_slot_info and current_time < TIME_SLOTS["lunch"]["start"]:
+                    status_message = f"현재 모터 작동 대기 중입니다 (다음 급식: {TIME_SLOTS['lunch']['start'].strftime('%H시%M분')})."
+                elif active_slot_info:
+                    all_fed = all(active_slot_info["activated_pets"].values())
+                    if all_fed:
+                        status_message = f"현재 {current_slot_name} 시간대이며, 모든 반려동물이 이미 급식받았습니다."
+                    else:
+                        not_fed_yet = [name for name, fed in active_slot_info["activated_pets"].items() if not fed]
+                        status_message = f"아직 급식받지 못한 반려동물: {', '.join(not_fed_yet)}"
+                
+                if (current_datetime.timestamp() - last_status_print_time) >= 10:
+                    print(f"[{current_time.strftime('%H:%M:%S')}] {status_message}")
+                    last_status_print_time = current_datetime.timestamp()
+
+            annotated_frame = frame_bgr.copy() 
+            
+            if results is not None and results and results[0].boxes:
+                annotated_frame = results[0].plot() 
+            else:
+                cv2.putText(annotated_frame, "Waiting for detection or no object detected", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            if inference_frame_count > 0: 
+                avg_inference_time = inference_times_sum / inference_frame_count
+                cv2.putText(annotated_frame, f"Infer: {avg_inference_time:.2f}s", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+            cv2.imshow("Pet Recognition System", annotated_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'): 
+                print("사용자 요청으로 시스템을 종료합니다.")
+                break
+
+            time.sleep(0.001) 
+
+    except KeyboardInterrupt: 
+        print("\n사용자가 스크립트를 수동으로 중단했습니다.")
+    except Exception as e: 
+        print(f"\n시스템 실행 중 예상치 못한 오류 발생: {e}")
+    finally: 
+        if 'picam2' in locals() and picam2: 
+            picam2.stop() 
+            print("Picamera2 카메라 리소스 해제 완료.")
+        cv2.destroyAllWindows() 
+        if 'ser' in locals() and ser.is_open: 
+            ser.close() 
+            print("시리얼 포트 닫기 완료.")
+        print("시스템 종료: 모든 자원이 해제되었습니다.")
+
+if __name__ == "__main__":
+    # Firebase 모터 제어 스레드 시작
+    motor_thread = threading.Thread(target=firebase_motor_control_thread, args=(ser,))
+    motor_thread.daemon = True 
+    motor_thread.start()
+    
+    # 메인 루프 시작
+    main_loop()
