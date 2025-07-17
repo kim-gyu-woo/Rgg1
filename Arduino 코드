@@ -1,0 +1,71 @@
+#include <Stepper.h> 
+
+const int STEPS_PER_REVOLUTION = 2048; 
+const int motorPin1 = 8;
+const int motorPin2 = 9;
+const int motorPin3 = 10;
+const int motorPin4 = 11;
+
+Stepper myStepper(STEPS_PER_REVOLUTION, motorPin1, motorPin3, motorPin2, motorPin4);
+
+void setup() {
+  Serial.begin(9600);  
+  Serial.println("아두이노 준비 완료: USB 시리얼 대기 중...");
+}
+
+void loop() {
+  //라즈베리파이로부터 명령어 수신
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n'); 
+    cmd.trim(); 
+    
+    Serial.print("라즈베리파이로부터 수신: [");
+    Serial.print(cmd);
+    Serial.println("]");
+    
+    processCommand(cmd); 
+  }
+}
+
+void processCommand(String cmd) {
+  if (cmd == "D1") {
+    Serial.println("D1 명령 처리.");
+    rotateMotorAndReturn(60, 5000); 
+  } else if (cmd == "D2") {
+    Serial.println("D2 명령 처리.");
+    rotateMotorAndReturn(60, 10000); 
+  } else if (cmd == "C1") {
+    Serial.println("C1 명령 처리.");
+    rotateMotorAndReturn(60, 5000); 
+  } else {
+    Serial.print("알 수 없는 명령: ");
+    Serial.println(cmd);
+  }
+}
+
+void rotateMotorAndReturn(int degrees, long total_duration_ms) {
+  int steps_for_rotation = map(degrees, 0, 360, 0, STEPS_PER_REVOLUTION);
+
+  if (steps_for_rotation == 0) { 
+    return;
+  }
+
+  float target_rpm = (float)steps_for_rotation * 2 / STEPS_PER_REVOLUTION / ((float)total_duration_ms / 160000.0F);
+
+  if (target_rpm < 1.0F) { target_rpm = 1.0F; }
+  if (target_rpm > 7.0F) { target_rpm = 7.0F; } 
+
+  myStepper.setSpeed((int)target_rpm); 
+
+  Serial.print("모터 동작 시작 (RPM: "); Serial.print(target_rpm); Serial.println(")");
+  Serial.print("정방향 스텝: "); Serial.println(steps_for_rotation);
+  myStepper.step(steps_for_rotation); 
+  Serial.println("정방향 회전 완료.");
+
+  Serial.print("역방향 스텝: "); Serial.println(-steps_for_rotation);
+  myStepper.step(-steps_for_rotation); 
+  Serial.println("역방향 회전 완료.");
+  
+  Serial.println("ARDUINO_CMD_COMPLETE"); 
+  Serial.println("모터 동작 완료.");
+}
